@@ -297,10 +297,10 @@ def run_and_return_ui(symbol, start, end, num_boost_round, max_depth, eta, thres
 # -------------------------
 with gr.Blocks(title="ROCm XGBoost Stock Demo") as demo:
     gr.HTML("""
-    <div id="header-bar">
-        <img src="https://upload.wikimedia.org/wikipedia/commons/7/7c/AMD_Logo.svg" 
-             alt="AMD Logo" style="height:40px; margin-right:15px;">
+    <div id="header-bar" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
         <h1>ROCm XGBoost Stock Prediction (MI300X-Ready)</h1>
+        <img src="https://upload.wikimedia.org/wikipedia/commons/7/7c/AMD_Logo.svg" 
+             alt="AMD Logo" style="height:40px;">
     </div>
     """)
 
