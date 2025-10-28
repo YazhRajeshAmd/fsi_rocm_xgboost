@@ -1,350 +1,192 @@
 """
-ROCm XGBoost Stock Demo (MI300X-ready)
-
-Run:
-  source ~/rocm_venv/bin/activate
-  python stock_rocm_ui_7865_fixed.py
-
-Open:
-  http://<your-host-ip>:7865
-
-Dependencies:
-  pip install yfinance pandas numpy scikit-learn matplotlib gradio pillow
-
-NOTE: xgboost must be the ROCm-built package installed in your venv.
+ROCm XGBoost Credit Card Fraud Detection (Train/Test UI with Top 20 Predictions + AMD Logo)
 """
+
 import io
-from PIL import Image
 import numpy as np
 import pandas as pd
-import yfinance as yf
 import matplotlib.pyplot as plt
-from sklearn.metrics import accuracy_score, roc_auc_score, roc_curve
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score,
+    roc_auc_score,
+    confusion_matrix,
+    ConfusionMatrixDisplay,
+)
 import xgboost as xgb
 import gradio as gr
-from datetime import datetime
+from PIL import Image
 
-plt.switch_backend("Agg")  # server-friendly
+plt.switch_backend("Agg")  # server-safe
 
-AMD_RED = "#ED1C24"
+# -------------------------
+# AMD colors
+# -------------------------
+AMD_TEAL = "#00C2DE"
 AMD_BLACK = "#1C1C1C"
-AMD_LOGO_PATH = "amd_logo.png"  # Put your AMD logo PNG here
+TEXT_WHITE = "#FFFFFF"
 
 # -------------------------
-# Feature engineering
+# Train/test ROCm pipeline
 # -------------------------
-def rsi(series, period=14):
-    delta = series.diff()
-    up = delta.clip(lower=0)
-    down = -1 * delta.clip(upper=0)
-    ma_up = up.ewm(com=period - 1, adjust=False).mean()
-    ma_down = down.ewm(com=period - 1, adjust=False).mean()
-    rs = ma_up / ma_down
-    return 100 - (100 / (1 + rs))
-
-def macd(series, fast=12, slow=26, signal=9):
-    ema_fast = series.ewm(span=fast, adjust=False).mean()
-    ema_slow = series.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
-
-def bollinger_bands(series, window=20, n_std=2):
-    ma = series.rolling(window).mean()
-    std = series.rolling(window).std()
-    upper = ma + n_std * std
-    lower = ma - n_std * std
-    width = (upper - lower) / ma
-    return upper, lower, width
-
-# -------------------------
-# Fetch and featurize
-# -------------------------
-def fetch_and_featurize(symbol, start="2015-01-01", end=None, market_symbols=None):
-    if end is None:
-        end = datetime.today().strftime("%Y-%m-%d")
-    df = yf.download(symbol, start=start, end=end, progress=False)
-    if df.empty:
-        raise ValueError(f"No data fetched for symbol: {symbol}")
-    df = df.reset_index()
-
-    # Force Close as Series (fixes multi-column DataFrame issues)
-    if isinstance(df['Close'], pd.DataFrame):
-        close_series = df['Close'].iloc[:, 0]
-    else:
-        close_series = df['Close']
-    close_series = close_series.astype(float)
-
-    # Price features
-    df['return'] = close_series.pct_change()
-    df['ret_lag1'] = df['return'].shift(1)
-    df['ma5'] = close_series.rolling(5).mean()
-    df['ma10'] = close_series.rolling(10).mean()
-    df['ma20'] = close_series.rolling(20).mean()
-    df['ma50'] = close_series.rolling(50).mean()
-    df['ma100'] = close_series.rolling(100).mean()
-    df['vol5'] = df['return'].rolling(5).std()
-    df['vol20'] = df['return'].rolling(20).std()
-    df['vol50'] = df['return'].rolling(50).std()
-
-    # Crossovers
-    df['ma5_ma20_cross'] = (df['ma5'] > df['ma20']).astype(int)
-    df['ma20_ma50_cross'] = (df['ma20'] > df['ma50']).astype(int)
-    df['ma50_ma100_cross'] = (df['ma50'] > df['ma100']).astype(int)
-
-    # Technical indicators
-    df['rsi14'] = rsi(close_series)
-    macd_line, macd_signal, macd_hist = macd(close_series)
-    df['macd'] = macd_line
-    df['macd_signal'] = macd_signal
-    df['macd_hist'] = macd_hist
-    bb_upper, bb_lower, bb_width = bollinger_bands(close_series)
-    df['bb_upper'] = bb_upper
-    df['bb_lower'] = bb_lower
-    df['bb_width'] = bb_width
-
-    # Price ratios
-    df['close_ma5_ratio'] = close_series / df['ma5'] - 1
-    df['close_ma20_ratio'] = close_series / df['ma20'] - 1
-    df['close_ma50_ratio'] = close_series / df['ma50'] - 1
-
-    # Target
-    df['return_next'] = df['return'].shift(-1)
-    df['direction'] = (df['return_next'] > 0).astype(int)
-
-    # Market-wide features
-    if market_symbols:
-        for mkt in market_symbols:
-            mkt_df = yf.download(mkt, start=start, end=end, progress=False)[['Close']]
-            mkt_df.rename(columns={'Close': 'Close_mkt'}, inplace=True)
-            mkt_df['return'] = mkt_df['Close_mkt'].pct_change()
-            mkt_df['vol20'] = mkt_df['return'].rolling(20).std()
-            df = df.merge(mkt_df[['return', 'vol20']], left_on='Date', right_index=True, how='left')
-            df.rename(columns={'return': f'{mkt}_return', 'vol20': f'{mkt}_vol'}, inplace=True)
-
-
-    df = df.dropna().reset_index(drop=True)
-    if df.empty:
-        raise ValueError("No data available after feature engineering (too short history?)")
-    return df
-
-# -------------------------
-# Backtest
-# -------------------------
-def backtest_signals(df, pred_prob, threshold=0.5):
-    sig = (pred_prob > threshold).astype(int)
-    strat_ret = sig * df['return_next'].values
-    cum = np.cumprod(1 + strat_ret) - 1
-    bh_cum = np.cumprod(1 + df['return_next'].values) - 1
-    return strat_ret, cum, bh_cum
-
-# -------------------------
-# Run pipeline
-# -------------------------
-def run_pipeline(symbol="AAPL", start="2015-01-01", end=None,
-                 num_boost_round=200, max_depth=6, eta=0.1, threshold=0.5,
-                 market_symbols=None):
+def train_and_predict(data_path="creditcard.csv", max_depth=6, eta=0.1, num_round=400):
     try:
-        df = fetch_and_featurize(symbol, start=start, end=end, market_symbols=market_symbols)
+        df = pd.read_csv(data_path)
     except Exception as e:
-        return {"error": str(e)}
+        return f"❌ Error loading dataset: {e}", None, None, None, None
 
-    feature_cols = [
-        "ret_lag1", "ma5", "ma10", "ma20", "ma50", "ma100",
-        "vol5", "vol20", "vol50",
-        "ma5_ma20_cross", "ma20_ma50_cross", "ma50_ma100_cross",
-        "rsi14", "macd", "macd_signal", "macd_hist", "bb_width",
-        "close_ma5_ratio", "close_ma20_ratio", "close_ma50_ratio", "Volume"
-    ]
+    if "Class" not in df.columns:
+        return "❌ Dataset must contain 'Class' column.", None, None, None, None
 
-    # Include market-wide features if present
-    if market_symbols:
-        for mkt in market_symbols:
-            feature_cols.append(f'{mkt}_return')
-            feature_cols.append(f'{mkt}_vol')
-
-    # Ensure columns exist
-    feature_cols = [c for c in feature_cols if c in df.columns]
-
-    X = df[feature_cols]
-    y = df["direction"]
-
-    # Train/test split safely
-    split_idx = int(len(df) * 0.8)
-    if split_idx < 1 or len(df) - split_idx < 1:
-        return {"error": "Not enough data for train/test split."}
-
-    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
-    df_test = df.iloc[split_idx:].reset_index(drop=True)
-
-    if X_train.empty or X_test.empty:
-        return {"error": "Train or test set is empty after preprocessing."}
+    # Split 80-20
+    X = df.drop(columns=["Class"])
+    y = df["Class"]
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, stratify=y, random_state=42
+    )
 
     dtrain = xgb.DMatrix(X_train, label=y_train)
     dtest = xgb.DMatrix(X_test, label=y_test)
 
     params = {
         "tree_method": "hist",
-        "device": "gpu",
+        "device": "gpu",  # ROCm GPU
         "objective": "binary:logistic",
         "eval_metric": "auc",
         "max_depth": int(max_depth),
-        "eta": float(eta)
+        "eta": float(eta),
+        "scale_pos_weight": (len(y_train) - sum(y_train)) / sum(y_train),
     }
 
+    print("🚀 Training XGBoost model on ROCm GPU...")
     bst = xgb.train(
         params,
         dtrain,
-        num_boost_round=int(num_boost_round),
+        num_boost_round=int(num_round),
         evals=[(dtrain, "train"), (dtest, "test")],
         early_stopping_rounds=10,
-        verbose_eval=False
+        verbose_eval=False,
     )
 
+    # Predictions
     y_prob = bst.predict(dtest)
-    if len(y_prob) == 0:
-        return {"error": "Predictions returned empty array."}
+    y_pred = (y_prob > 0.5).astype(int)
 
-    y_pred = (y_prob > threshold).astype(int)
     acc = accuracy_score(y_test, y_pred)
     auc = roc_auc_score(y_test, y_prob)
-    strat_ret, cum, bh_cum = backtest_signals(df_test, y_prob, threshold)
+    cm = confusion_matrix(y_test, y_pred)
 
-    plots = {}
-
-    # Equity Curve
-    fig, ax = plt.subplots(figsize=(8, 4))
-    ax.plot(df_test['Date'], cum, label='Model strategy', color=AMD_RED)
-    ax.plot(df_test['Date'], bh_cum, label='Buy & Hold', color=AMD_BLACK)
-    ax.set_title(f"Equity Curve ({symbol})")
-    ax.set_xlabel("Date")
-    ax.set_ylabel("Cumulative Return")
-    ax.legend()
-    fig.autofmt_xdate()
+    # -------------------------
+    # Confusion Matrix Plot
+    # -------------------------
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["Normal", "Fraud"])
+    fig, ax = plt.subplots(figsize=(4, 4))
+    disp.plot(ax=ax, cmap="Blues", colorbar=False)
+    ax.set_title("Confusion Matrix", color=TEXT_WHITE)
+    fig.patch.set_facecolor(AMD_BLACK)
+    ax.set_facecolor(AMD_BLACK)
+    for spine in ax.spines.values():
+        spine.set_color(TEXT_WHITE)
+    ax.tick_params(colors=TEXT_WHITE)
     buf = io.BytesIO()
-    fig.savefig(buf, format='png', bbox_inches='tight')
+    plt.savefig(buf, format="png", bbox_inches="tight", facecolor=AMD_BLACK)
     buf.seek(0)
-    plots['equity_curve'] = buf
+    cm_img = Image.open(buf)
     plt.close(fig)
 
-    # ROC Curve
-    fpr, tpr, _ = roc_curve(y_test, y_prob)
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.plot(fpr, tpr, label=f"AUC = {auc:.3f}", color=AMD_RED)
-    ax.plot([0, 1], [0, 1], '--', color='gray')
-    ax.set_title("ROC Curve")
-    ax.set_xlabel("FPR")
-    ax.set_ylabel("TPR")
-    ax.legend()
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png', bbox_inches='tight')
-    buf.seek(0)
-    plots['roc'] = buf
-    plt.close(fig)
+    # -------------------------
+    # Build predictions DataFrame
+    # -------------------------
+    pred_df = X_test.copy()
+    pred_df["True_Label"] = y_test.values
+    pred_df["Predicted_Label"] = y_pred
+    pred_df["Fraud_Probability"] = y_prob
 
-    # Feature importance
-    try:
-        fig = xgb.plot_importance(bst, importance_type='gain', show_values=False).figure
-        buf = io.BytesIO()
-        fig.savefig(buf, format='png', bbox_inches='tight')
-        buf.seek(0)
-        plots['feat_imp'] = buf
-        plt.close(fig)
-    except Exception:
-        plots['feat_imp'] = None
+    # Sort by highest fraud probability
+    top20 = pred_df.sort_values("Fraud_Probability", ascending=False).head(20).reset_index(drop=True)
 
-    return {
-        "symbol": symbol,
-        "accuracy": float(acc),
-        "auc": float(auc),
-        "n_train": len(X_train),
-        "n_test": len(X_test),
-        "plots": plots
-    }
+    # Save full predictions to file
+    pred_csv = "fraud_predictions.csv"
+    pred_df.to_csv(pred_csv, index=False)
 
-# -------------------------
-# Convert buffer to PIL image
-# -------------------------
-def buf_to_pil(buf):
-    if buf is None: return None
-    buf.seek(0)
-    return Image.open(buf)
-
-# -------------------------
-# Gradio UI
-# -------------------------
-def run_and_return_ui(symbol, start, end, num_boost_round, max_depth, eta, threshold):
-    out = run_pipeline(symbol, start, end, num_boost_round, max_depth, eta, threshold, market_symbols=["^GSPC","^IXIC"])
-    if "error" in out:
-        return out["error"], None, None, None, None
-
-    eq_img = buf_to_pil(out['plots']['equity_curve'])
-    roc_img = buf_to_pil(out['plots']['roc'])
-    feat_img = buf_to_pil(out['plots']['feat_imp'])
-
+    # -------------------------
+    # Build summary text
+    # -------------------------
     summary = (
-        f"Symbol: {out['symbol']}\n"
-        f"Train samples: {out['n_train']}, Test samples: {out['n_test']}\n"
-        f"Accuracy: {out['accuracy']:.4f}, AUC: {out['auc']:.4f}\n"
+        f"### 📊 Model Summary\n"
+        f"**Train samples:** {len(X_train):,}  **Test samples:** {len(X_test):,}\n"
+        f"**Accuracy:** {acc:.4f}  **AUC:** {auc:.4f}\n\n"
+        f"✅ Predictions saved to `{pred_csv}`"
     )
 
-    return summary, eq_img, roc_img, feat_img, out['auc']
+    return summary, cm_img, auc, acc, top20, pred_csv
+
 
 # -------------------------
-# Gradio UI layout
+# Gradio UI with AMD logo
 # -------------------------
-with gr.Blocks(title="ROCm XGBoost Stock Demo") as demo:
-    gr.HTML("""
-    <div id="header-bar" style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-        <h1>ROCm XGBoost Stock Prediction (MI300X-Ready)</h1>
-        <img src="https://upload.wikimedia.org/wikipedia/commons/7/7c/AMD_Logo.svg" 
-             alt="AMD Logo" style="height:40px;">
+custom_css = f"""
+#header {{
+    background-color: {AMD_TEAL};
+    color: {TEXT_WHITE};
+    padding: 15px 20px;
+    border-radius: 10px;
+    text-align: left;
+    font-size: 1.2em;
+    font-weight: bold;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}}
+#header img {{
+    height: 40px;
+}}
+footer {{visibility: hidden;}}
+.gr-button {{
+    background-color: {AMD_TEAL} !important;
+    color: {AMD_BLACK} !important;
+    font-weight: bold;
+}}
+"""
+
+with gr.Blocks(css=custom_css, title="ROCm XGBoost Fraud Detection") as demo:
+    gr.HTML(f"""
+    <div style="position: relative; padding: 20px; background: linear-gradient(135deg, #f8f9fa 0%, #00c2de 100%); border-radius: 10px; margin-bottom: 20px;">
+                <h1 style="margin:0; font-weight: 700;">AMD Instinct MI3xx ROCm-Powered XGBoost Credit Card Fraud Detection Demo</h1>
+                <img src="https://upload.wikimedia.org/wikipedia/commons/7/7c/AMD_Logo.svg"
+                     alt="AMD Logo" style="position: absolute; top: 10px; right: 20px; height: 50px;">
     </div>
     """)
 
     gr.Markdown("""
-    ## 📊 About this Demo
-    This demo shows how **ROCm-accelerated XGBoost** on AMD GPUs (like the MI300X)  
-    can be used for **stock market prediction and backtesting**.  
-
-    It downloads stock data, engineers financial indicators (RSI, MACD, Bollinger Bands, etc.),  
-    trains an XGBoost model on GPU, and compares model-driven strategies with **buy & hold**.  
-
-    ### What you’ll see:
-    - **Equity Curve** → How the model-based trading strategy performs vs Buy & Hold  
-    - **ROC Curve** → The classification power of the model (AUC score shows performance)  
-    - **Feature Importance** → Which technical indicators influenced the model most  
+    This app:
+    1. Loads **creditcard.csv** from Kaggle  
+    2. Splits into 80% train / 20% test  
+    3. Trains XGBoost on **AMD ROCm GPU**  
+    4. Predicts test transactions and shows top 20 most suspicious ones
     """)
 
     with gr.Row():
         with gr.Column(scale=2):
-            ticker = gr.Textbox(value="AAPL", label="Ticker")
-            start = gr.Textbox(value="2019-01-01", label="Start date")
-            end = gr.Textbox(value="", label="End date (leave empty for today)")
-            num_boost = gr.Number(value=1000, label="num_boost_round", precision=0)
-            max_depth = gr.Number(value=6, label="max_depth", precision=0)
-            eta = gr.Number(value=0.05, label="eta", precision=2)
-            threshold = gr.Number(value=0.5, label="Probability threshold")
-            run_btn = gr.Button("Run")
-        with gr.Column(scale=3):
-            out_text = gr.Textbox(label="Summary / Status", lines=8)
-            gr.Markdown("### 📈 Equity Curve")
-            eq_img = gr.Image(label="Equity Curve")
-            gr.Markdown("### 🎯 ROC Curve")
-            roc_img = gr.Image(label="ROC Curve")
-            gr.Markdown("### 🔍 Feature Importance")
-            feat_img = gr.Image(label="Feature Importance")
-            auc_val = gr.Number(label="AUC")
+            data_path = gr.Textbox(value="creditcard.csv", label="Dataset path")
+            max_depth = gr.Number(value=6, label="Max Depth")
+            eta = gr.Number(value=0.1, label="Learning Rate (eta)")
+            num_round = gr.Number(value=400, label="Boost Rounds")
+            run_btn = gr.Button("Train and Predict on ROCm GPU")
 
-    def _on_run(ticker, start, end, num_boost, max_depth, eta, threshold):
-        return run_and_return_ui(ticker, start, end, int(num_boost), int(max_depth), float(eta), float(threshold))
+        with gr.Column(scale=3):
+            out_summary = gr.Markdown()
+            cm_image = gr.Image(label="Confusion Matrix")
+            auc_val = gr.Number(label="AUC")
+            acc_val = gr.Number(label="Accuracy")
+            gr.Markdown("### Top 20 Transactions by Fraud Probability")
+            top_table = gr.Dataframe(label="Top 20 Fraud Predictions (sorted by probability)")
+            file_link = gr.File(label="Download All Predictions CSV")
 
     run_btn.click(
-        fn=_on_run,
-        inputs=[ticker, start, end, num_boost, max_depth, eta, threshold],
-        outputs=[out_text, eq_img, roc_img, feat_img, auc_val]
+        fn=train_and_predict,
+        inputs=[data_path, max_depth, eta, num_round],
+        outputs=[out_summary, cm_image, auc_val, acc_val, top_table, file_link],
     )
 
 if __name__ == "__main__":
