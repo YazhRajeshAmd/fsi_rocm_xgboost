@@ -76,6 +76,8 @@ pip install yfinance pandas numpy scikit-learn matplotlib gradio pillow
 
 ### 4. Install ROCm XGBoost
 Follow [XGBoost ROCm build instructions](https://xgboost.readthedocs.io/en/latest/build.html#building-with-gpu-support) to compile and install XGBoost with HIP support for your MI300X.
+
+```bash
 git clone https://github.com/ROCmSoftwarePlatform/xgboost.git
 cd xgboost
 git submodule update --init --recursive
@@ -84,12 +86,13 @@ mkdir build
 cd build
 cmake -DUSE_HIP=ON -DCMAKE_HIP_ARCHITECTURES="gfx90a" -DUSE_RCCL=1 ../
 make -j
+```
 
 You can now compile XGBoost into a Python package. It should install XGBoost version 2.1.0-dev.
-
+```bash
 cd python-package
 pip install .
-
+```
 ## Running the Demo
 ```bash
 source ~/rocm_venv/bin/activate
